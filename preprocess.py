@@ -21,77 +21,59 @@ def subset_pfi_m_only(df: pd.DataFrame) -> pd.DataFrame:
     return df[["PATIENT_ID", "PFS_M_ADV_STATUS", "PFS_M_ADV_MONTHS"]]
 
 
-def sync_dfs(ca: pd.DataFrame, cna: pd.DataFrame, pred_vars: list, saveas: str) -> None:
-    # get hugo symbols from both ca & cna files
-    hs1 = cna["Hugo_Symbol"].tolist()
-    hs2 = ca["Hugo_Symbol"].value_counts().index.tolist()
+def reconfigure_cna_df(cna_df: pd.DataFrame) -> pd.DataFrame:
+    hugo = cna_df["Hugo_Symbol"].value_counts().index.tolist()
+    cna_df = cna_df.drop(["Hugo_Symbol"], axis=1)
+    cna_df = cna_df.transpose().reset_index()
 
-    # get intersection of hugo symbols from both ca & cna files
-    result = Counter(hs1) & Counter(hs2)
-    intersected_list = list(result.elements())
-
-    # subset both ca & cna files with the overlapping hugo symbols
-    cna = cna.loc[cna["Hugo_Symbol"].isin(intersected_list)]
-    ca = ca.loc[ca["Hugo_Symbol"].isin(intersected_list)]
-
-    # get tumor_sample_barcodes from CNA file
-    tsb_cna = cna.columns.tolist()[1:]
-
-    # line-up ca tumor_sample_barcodes with cna tumor_sample_barcodes
-    ca = ca.loc[ca["Tumor_Sample_Barcode"].isin(tsb_cna)]
-
-    # create patient_id column
-    ca["PATIENT_ID"] = ca.apply(
-        lambda x: "-".join(x["Tumor_Sample_Barcode"].split("-")[:4])
-        if len(x["Tumor_Sample_Barcode"].split("-")) == 6
-        else "-".join(x["Tumor_Sample_Barcode"].split("-")[:3]),
-        axis=1,
-    )
-    ca["vaf"] = ca["t_alt_count"] / (ca["t_ref_count"] + ca["t_alt_count"])
-
-    ca_sub = ca[pred_vars]
-
-    ca_sub.to_csv(saveas, sep="\t", index=False)
+    hugo.insert(0, "Tumor_Sample_Barcode")
+    cna_df = cna_df.set_axis(hugo, axis=1)
+    return cna_df
 
 
 def fill_cna(ca: pd.DataFrame, cna: pd.DataFrame) -> pd.DataFrame:
+    start = time.time()
     ca.insert(8, "CNA", 0.0)
-    for i in range(len(ca)):
-        hugo = ca.loc[i, "Hugo_Symbol"]
-        tsb = ca.loc[i, "Tumor_Sample_Barcode"]
-        # print(i, hugo, tsb)
-        cna_val = cna.loc[cna["Hugo_Symbol"] == hugo][tsb].item()
-        ca.loc[i, "CNA"] = cna_val
+
+    tsb = cna["Tumor_Sample_Barcode"].value_counts().index.tolist()
+    hs = cna.columns.tolist()
+    hs.pop(0)
+
+    for i in tsb:
+        for j in hs:
+            cna_val = cna.loc[cna["Tumor_Sample_Barcode"] == i][j]
+            row = ca.loc[(ca["Tumor_Sample_Barcode"] == i) & (ca["Hugo_Symbol"] == j)]
+            if len(row) > 0:
+                row["CNA"] = cna_val
+    print(f"Time elapse to fill CNA: {time.time() - start:.2f} s")
     return ca
 
 
 def prepare_data(ca_type: str, parent_dir: str) -> None:
     ca_df = read_csv(f"{parent_dir}/{ca_type}/data_mutations_extended.txt")
+    # create vaf column
+    ca_df["vaf"] = ca_df["t_alt_count"] / (ca_df["t_ref_count"] + ca_df["t_alt_count"])
+    
     cna_df = read_csv(f"{parent_dir}/{ca_type}/data_CNA.txt")
+    cna_df = reconfigure_cna_df(cna_df=cna_df)
 
     pred_vars = [
         "PATIENT_ID",
         "Tumor_Sample_Barcode",
         "Hugo_Symbol",
-        # "Entrez_Gene_Id",
+        "Entrez_Gene_Id",
         "Variant_Classification",
         "t_ref_count",
         "t_alt_count",
+        "t_depth",
         "vaf",
         "Polyphen_Prediction",
-        # "Polyphen_Score",
+        "Polyphen_Score",
     ]
 
-    saveas = f"{parent_dir}/{ca_type}/{ca_type}.csv"
-    sync_dfs(
-        ca=ca_df,
-        cna=cna_df,
-        pred_vars=pred_vars,
-        saveas=saveas,
-    )
+    ca_df_sub = ca_df[pred_vars]
 
-    new_ca_df = read_csv(saveas)
-    new_ca_df = fill_cna(ca=new_ca_df, cna=cna_df)
+    new_ca_df = fill_cna(ca=ca_df_sub, cna=cna_df)
     new_ca_df.to_csv(
         f"{parent_dir}/{ca_type}/final_{ca_type}.csv", sep="\t", index=False
     )
