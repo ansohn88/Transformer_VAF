@@ -1,9 +1,10 @@
 from typing import Optional
 
 import torch
-from einops import pack, repeat, unpack
+from einops import pack, rearrange, repeat, unpack
 from einops.layers.torch import Rearrange
 from torch import nn
+from torch.nn import functional as F
 
 from attend import Attend
 from simpool import SimPool
@@ -12,34 +13,49 @@ from simpool import SimPool
 def exists(val):
     return val is not None
 
+class RevIN(nn.Module):
+    def __init__(self, num_variates, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.num_variates = num_variates
+        self.gamma = nn.Parameter(torch.ones(num_variates, 1))
+        self.beta = nn.Parameter(torch.zeros(num_variates, 1))
 
-# class ScaledSinusoidalEmbedding(nn.Module):
-#     def __init__(self, dim, theta=10000):
-#         super().__init__()
-#         assert (dim % 2) == 0
-#         self.scale = nn.Parameter(torch.ones(1) * dim**-0.5)
+    def forward(self, x, return_statistics=False):
+        assert x.shape[1] == self.num_variates
 
-#         half_dim = dim // 2
-#         freq_seq = torch.arange(half_dim).float() / half_dim
-#         inv_freq = theta**-freq_seq
-#         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        var = torch.var(x, dim=-1, unbiased=False, keepdim=True)
+        mean = torch.mean(x, dim=-1, keepdim=True)
+        var_rsqrt = var.clamp(min=self.eps).rsqrt()
+        instance_normalized = (x - mean) * var_rsqrt
+        rescaled = instance_normalized * self.gamma + self.beta
 
-#     def forward(self, x, pos=None):
-#         seq_len, device = x.shape[1], x.device
+        def reverse_fn(scaled_output):
+            clamped_gamma = torch.sign(self.gamma) * self.gamma.abs().clamp(
+                min=self.eps
+            )
+            unscaled_output = (scaled_output - self.beta) / clamped_gamma
+            return unscaled_output * var.sqrt() + mean
 
-#         if not exists(pos):
-#             pos = torch.arange(seq_len, device=device)
+        if not return_statistics:
+            return rescaled, reverse_fn
 
-#         emb = torch.einsum("i, j -> i j", pos, self.inv_freq)
-#         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-#         return emb * self.scale
+        statistics = Statistics(mean, var, self.gamma, self.beta)
+
+        return rescaled, reverse_fn, statistics
+
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gate = rearrange(x, "... (r d) -> r ... d", r=2)
+        return x * F.gelu(gate)
 
 
 def FeedForward(dim, mult=4, dropout=0.0):
     dim_inner = int(dim * mult)
     return nn.Sequential(
         nn.Linear(dim, dim_inner),
-        nn.GELU(),
+        nn.GEGLU(),
         nn.Dropout(dropout),
         nn.Linear(dim_inner, dim),
     )
@@ -55,6 +71,13 @@ class Attention(nn.Module):
             nn.Linear(dim, dim_inner * 3, bias=False),
             Rearrange("b n (qkv h d) -> qkv b h n d", qkv=3, h=heads),
         )
+
+        self.to_v_gates = nn.Sequential(
+            nn.Linear(dim, dim_inner, bias=False),
+            nn.SiLU(),
+            Rearrange("b n (h d) -> b h n d", h=heads),
+        )
+        
         self.attend = Attend(flash=flash, dropout=dropout)
 
         self.to_out = nn.Sequential(
@@ -66,6 +89,7 @@ class Attention(nn.Module):
     def forward(self, x):
         q, k, v = self.to_qkv(x)
         out = self.attend(q, k, v)
+        out = out * self.to_v_gates(x
         return self.to_out(out)
 
 
@@ -85,6 +109,7 @@ class iTransformer(nn.Module):
         ff_dropout: float,
         out_dim: int = 2,
         flash_attn: bool = True,
+        use_reversible_instance_norm: bool = False,
         simpool: bool = False,
         gamma: Optional[float] = None,
         use_beta: bool = False
@@ -93,12 +118,19 @@ class iTransformer(nn.Module):
 
         self.mlp_in = nn.Sequential(
             nn.Linear(num_variates, dim * num_tokens_per_variate),
-            nn.LayerNorm(dim),
             Rearrange("b v (n d) -> b (v n) d", n=num_tokens_per_variate),
             nn.LayerNorm(dim),
         )
 
-        self.register_tokens = nn.Parameter(torch.randn(num_register_tokens, dim))
+        self.register_tokens = (
+            nn.Parameter(torch.randn(num_register_tokens, dim))
+            if num_register_tokens > 0
+            else None
+        )
+
+        self.reversible_instance_norm = (
+            RevIN(num_variates) if use_reversible_instance_norm else None
+        )
 
         self.layers = nn.ModuleList([])
         for _ in range(depth):
@@ -137,11 +169,16 @@ class iTransformer(nn.Module):
         # batch, device = x.shape[0], x.device
         batch = x.shape[0]
 
+        has_mem = exists(self.register_tokens)
+
+        if exists(self.reversible_instance_norm):
+            x, reverse_fn = self.reversible_instance_norm(x)
+
         x = self.mlp_in(x)
 
-        r = repeat(self.register_tokens, "n d -> b n d", b=batch)
-
-        x, ps = pack([x, r], "b * d")
+        if has_mem:
+            r = repeat(self.register_tokens, "n d -> b n d", b=batch)
+            x, ps = pack([x, r], "b * d")
 
         for attn, attn_post_norm, ff, ff_post_norm in self.layers:
             x = attn(x) + x
@@ -149,7 +186,11 @@ class iTransformer(nn.Module):
             x = ff(x) + x
             x = ff_post_norm(x)
 
-        x, _ = unpack(x, ps, "b * d")
+        if has_mem:
+            x, _ = unpack(x, ps, "b * d")
+
+        if exists(self.reversible_instance_norm):
+            x = reverse_fn(x)
 
         if self.simpool:
             x = self.pool(x)
